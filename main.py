@@ -90,7 +90,7 @@ def _enable_dpi_awareness():
 
 _enable_dpi_awareness()
 
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.9.1"
 GITHUB_REPO = "BigSteve3838292/FloatingWeatherClock"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_API_RELEASES = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
@@ -662,12 +662,17 @@ if(navigator.geolocation){
         self.end_headers()
         self.wfile.write(html.encode("utf-8"))
 
+from PIL import ImageFont
 
 def create_tray_icon():
     img = Image.new("RGB", (64, 64), color=(34, 40, 54))
     draw = ImageDraw.Draw(img)
     draw.ellipse((8, 8, 56, 56), fill="#4299e1")
-    draw.text((22, 20), "时", fill="white", font_size=22)
+    try:
+        font = ImageFont.truetype("msyh.ttc", 22)  # 微软雅黑
+        draw.text((20, 18), "时", fill="white", font=font)
+    except Exception:
+        pass
     return img
 
 
@@ -717,6 +722,7 @@ class FloatingWeatherClock:
         self.cached_w = 0
         self.cached_h = 0
         self.last_time_str = ""
+        self.last_date_str = time.strftime("%Y-%m-%d", time.localtime())  # 跨天检测用
         self.need_redraw = True
         self.resize_throttle_id = None
         self.config = self.load_config()
@@ -757,6 +763,7 @@ class FloatingWeatherClock:
         self.test_weather_data = None
         self.test_weather_mode = "auto"
         self.sim_date = None
+        self.sim_yuexiang = None
 
         self.is_refresh_hint = False
         self.auto_refresh_interval = 300
@@ -991,6 +998,35 @@ class FloatingWeatherClock:
             for f in (lunar.getOtherFestivals() or []):
                 if f not in other_list:
                     other_list.append(f)
+                    
+            # ===== 月相计算（农历日 → 8 相索引）=====
+            day = lunar.getDay()
+            if day == 1:
+                yue_idx = 0
+            elif day <= 6:
+                yue_idx = 1
+            elif day <= 8:
+                yue_idx = 2
+            elif day <= 13:
+                yue_idx = 3
+            elif day <= 16:
+                yue_idx = 4
+            elif day <= 21:
+                yue_idx = 5
+            elif day <= 23:
+                yue_idx = 6
+            else:
+                yue_idx = 7
+                
+            self.log(f"[月相] 农历{day}日 → 索引{yue_idx}")
+            
+            # 开发者：强制月相覆盖
+            if self.sim_yuexiang is not None:
+                try:
+                    yue_idx = int(self.sim_yuexiang) % 8
+                    self.log(f"[月相] 开发者覆盖 → 索引{yue_idx}")
+                except Exception:
+                    pass
 
             return {
                 "date": today.strftime("%Y-%m-%d"),
@@ -1001,6 +1037,8 @@ class FloatingWeatherClock:
                 "jie_qi_tomorrow": jie_qi_tomorrow,
                 "festivals": festivals,
                 "other_festivals": other_list,
+                "yue_xiang": lunar.getYueXiang(),
+                "yue_xiang_index": yue_idx,
             }
         except Exception as e:
             self.log(f"日期信息获取失败: {e}")
@@ -3149,7 +3187,47 @@ class FloatingWeatherClock:
                 self._fetch_all_dates_async()
                 self.need_redraw = True
                 self.log(f"[模拟日期] 已设置为：{self.sim_date or '（真实日期）'}")
+            
+            group_sim_moon = ttk.LabelFrame(main_frame, text="模拟月相（独立功能，不保存）", padding=10)
+            group_sim_moon.pack(fill=tk.X, pady=6)
 
+            tk.Label(group_sim_moon,
+                     text="0=新月 1=峨眉月 2=上弦月 3=盈凸月 4=满月 5=亏凸月 6=下弦月 7=残月\n"
+                          "填 0~7 强制月相；留空跟随真实月相。",
+                     fg="#888888", font=(self.font_family, 8), justify="left").pack(anchor="w")
+
+            sim_moon_var = tk.StringVar(
+                value="" if self.sim_yuexiang is None else str(self.sim_yuexiang)
+            )
+            frame_sm = ttk.Frame(group_sim_moon)
+            frame_sm.pack(fill=tk.X, pady=(4, 0))
+            ttk.Entry(frame_sm, textvariable=sim_moon_var, width=8).pack(side=tk.LEFT)
+
+            def apply_sim_moon():
+                s = sim_moon_var.get().strip()
+                if s:
+                    try:
+                        n = int(s)
+                    except Exception:
+                        messagebox.showerror("错误", "月相索引必须是 0~7 的整数", parent=win)
+                        return
+                    if n < 0 or n > 7:
+                        messagebox.showerror("错误", "月相索引必须在 0~7 之间", parent=win)
+                        return
+                    self.sim_yuexiang = n
+                else:
+                    self.sim_yuexiang = None
+                # 重新生成 date_cache，让图标/背景/文字都刷新
+                self.date_cache = self._get_date_info()
+                self.need_redraw = True
+                self.update_clock()
+                moon_txt = self.sim_yuexiang if self.sim_yuexiang is not None else "（真实月相）"
+                self.log(f"[模拟月相] 已设置为：{moon_txt}")
+
+            # 月相自己的「应用」按钮（关键：原来这里绑错了）
+            ttk.Button(frame_sm, text="应用", command=apply_sim_moon).pack(side=tk.LEFT, padx=4)
+
+            # 日期自己的「应用」按钮（保留原样）
             ttk.Button(frame_sd, text="应用", command=apply_sim_date).pack(side=tk.LEFT, padx=4)
 
             group_dbg = ttk.LabelFrame(main_frame, text="调试选项", padding=10)
@@ -3216,6 +3294,7 @@ class FloatingWeatherClock:
                         self.test_weather_data = None
                         self.test_weather_mode = "auto"
                         self.weather_data = None
+                        self.sim_yuexiang = None
                         self.is_refresh_hint = True
                         self.reset_refresh_countdown()
                         self.fetch_all_async()
@@ -4827,11 +4906,15 @@ class FloatingWeatherClock:
                               x - int(r * 0.55) + hl, y - int(r * 0.55) + hl,
                               fill="#fff5b8", outline="", tags="icon")
             else:
-                bg = self.bg_color
-                c.create_oval(x - r, y - r, x + r, y + r, fill="#f5e6a8", outline="", tags="icon")
-                c.create_oval(x - r + int(r * 0.55), y - r - int(r * 0.15),
-                              x + r + int(r * 0.55), y + r - int(r * 0.15),
-                              fill=bg, outline="", tags="icon")
+                # 用月相画月亮
+                phase_idx = 4
+                if self.date_cache is not None:
+                    try:
+                        phase_idx = int(self.date_cache.get("yue_xiang_index", 4))
+                    except Exception:
+                        phase_idx = 4
+                self._draw_moon(c, x, y, r, phase_idx, self.bg_color, tags="icon")
+
                 star_r = max(1, ss(1))
                 for (sx, sy) in [(x + int(r * 0.5), y - int(r * 0.6)),
                                  (x + int(r * 0.2), y + int(r * 0.3)),
@@ -4864,17 +4947,19 @@ class FloatingWeatherClock:
                               fill="#a0acba", outline="", tags="icon")
                 c.create_oval(x - int(r * 0.15), y - int(r * 0.7), x + int(r * 0.55), y - int(r * 0.05),
                               fill="#b8c4d0", outline="", tags="icon")
+
+                # 用月相画月亮
                 moon_r = int(r * 0.4)
                 moon_x = x + int(r * 0.75)
                 moon_y = y - int(r * 0.55)
-                c.create_oval(moon_x - moon_r, moon_y - moon_r,
-                              moon_x + moon_r, moon_y + moon_r,
-                              fill="#f0ecd0", outline="#c8c098",
-                              width=max(1, ss(1)), tags="icon")
-                shadow_off = int(moon_r * 0.55)
-                c.create_oval(moon_x - moon_r + shadow_off, moon_y - moon_r - int(moon_r * 0.1),
-                              moon_x + moon_r + shadow_off, moon_y + moon_r - int(moon_r * 0.1),
-                              fill=self.bg_color, outline="", tags="icon")
+                phase_idx = 4
+                if self.date_cache is not None:
+                    try:
+                        phase_idx = int(self.date_cache.get("yue_xiang_index", 4))
+                    except Exception:
+                        phase_idx = 4
+                self._draw_moon(c, moon_x, moon_y, moon_r, phase_idx, self.bg_color, tags="icon")
+
                 star_r = max(1, ss(1))
                 for (sx, sy) in [(x + int(r * 0.95), y - int(r * 0.85)),
                                  (x + int(r * 0.60), y - int(r * 0.95))]:
@@ -4972,13 +5057,29 @@ class FloatingWeatherClock:
     def update_clock_loop(self):
         if self.is_quitting:
             return
+
+        # ---- 每秒检测：时间字符串变化就重绘 ----
         time_str = time.strftime("%H:%M:%S", time.localtime())
         if time_str != self.last_time_str:
             self.last_time_str = time_str
             self.need_redraw = True
+
+        # ---- 跨天检测：真实日期变化就立即刷新农历/节气/节日/节假日 ----
+        # 解决"跨天瞬间日期主体已更新、但农历/节日仍显示昨天、要等最多 5 分钟"的问题
+        today_str = time.strftime("%Y-%m-%d", time.localtime())
+        if today_str != self.last_date_str:
+            self.last_date_str = today_str
+            self.log(f"[跨天] 检测到日期变化 → {today_str}，立即刷新日期/节假日")
+            self.date_cache = None
+            self.holiday_cache = None
+            self.refresh_start_time = time.time()   # 让"获取中…"的超时判断重新计时
+            self._fetch_all_dates_async()
+            self.need_redraw = True
+
         if self.need_redraw:
             self.update_clock()
             self.need_redraw = False
+
         self.root.after(1000, self.update_clock_loop)
 
     def _draw_rpg_bg(self, canvas, w, h):
@@ -5178,13 +5279,14 @@ class FloatingWeatherClock:
 
             self._soft_glow(canvas, moon_x, moon_y, int(moon_r * 2.4),
                             (235, 245, 255), bg_for_glow)
-            canvas.create_oval(moon_x - moon_r, moon_y - moon_r,
-                               moon_x + moon_r, moon_y + moon_r,
-                               fill="#f8f8e0", outline="", tags="weatherbg")
-            shadow_offset = int(moon_r * 0.55)
-            canvas.create_oval(moon_x - moon_r + shadow_offset, moon_y - moon_r - int(moon_r*0.1),
-                               moon_x + moon_r + shadow_offset, moon_y + moon_r - int(moon_r*0.1),
-                               fill=panel_color, outline="", tags="weatherbg")
+            phase_idx = 4
+            if self.date_cache is not None:
+                try:
+                    phase_idx = int(self.date_cache.get("yue_xiang_index", 4))
+                except Exception:
+                    phase_idx = 4
+            self._draw_moon(canvas, moon_x, moon_y, moon_r, phase_idx,
+                            panel_color, tags="weatherbg")
 
             import random
             random.seed(42)
@@ -5218,13 +5320,14 @@ class FloatingWeatherClock:
                 moon_r = int(10 * k)
                 self._soft_glow(canvas, moon_x, moon_y, int(moon_r * 2.2),
                                 (235, 245, 255), bg_for_glow)
-                canvas.create_oval(moon_x - moon_r, moon_y - moon_r,
-                                   moon_x + moon_r, moon_y + moon_r,
-                                   fill="#f8f8e0", outline="", tags="weatherbg")
-                shadow_offset = int(moon_r * 0.55)
-                canvas.create_oval(moon_x - moon_r + shadow_offset, moon_y - moon_r,
-                                   moon_x + moon_r + shadow_offset, moon_y + moon_r,
-                                   fill=panel_color, outline="", tags="weatherbg")
+                phase_idx = 4
+                if self.date_cache is not None:
+                    try:
+                        phase_idx = int(self.date_cache.get("yue_xiang_index", 4))
+                    except Exception:
+                        phase_idx = 4
+                self._draw_moon(canvas, moon_x, moon_y, moon_r, phase_idx,
+                                panel_color, tags="weatherbg")
 
             cloud_top = (int(mid_rgb[0]*0.5+115), int(mid_rgb[1]*0.5+122), int(mid_rgb[2]*0.5+134))
             cloud_bot = (int(mid_rgb[0]*0.5+80),  int(mid_rgb[1]*0.5+88),  int(mid_rgb[2]*0.5+100))
@@ -5536,6 +5639,16 @@ class FloatingWeatherClock:
                     detail_holiday = f"节假日：{note} [班]"
                 else:
                     detail_holiday = f"节假日：{note or '普通工作日'}"
+                    
+        yue_names = {
+            0: "新月", 1: "峨眉月", 2: "上弦月", 3: "盈凸月",
+            4: "满月", 5: "亏凸月", 6: "下弦月", 7: "残月",
+        }
+        detail_yuexiang = ""
+        if di:
+            yx = di.get("yue_xiang_index")
+            if yx is not None:
+                detail_yuexiang = f"月相：{yue_names.get(yx, '未知')}"            
 
         return {
             "normal_line1": normal_line1,
@@ -5544,6 +5657,7 @@ class FloatingWeatherClock:
             "detail_jieqi": detail_jieqi,
             "detail_festivals": detail_festivals,
             "detail_holiday": detail_holiday,
+            "detail_yuexiang": detail_yuexiang,
         }
 
     def update_clock(self):
@@ -5629,6 +5743,12 @@ class FloatingWeatherClock:
             date_main_text = date_info["normal_line1"]
             date_main_color = sub_color
             date_sub_text = date_info["normal_line2"]
+            # 把月相追加到副行末尾（普通/详细模式共用这个变量）
+            if date_info.get("detail_yuexiang"):
+                if date_sub_text:
+                    date_sub_text += " · " + date_info["detail_yuexiang"]
+                else:
+                    date_sub_text = date_info["detail_yuexiang"]
             date_sub_color = sub_color
         else:
             if date_timed_out:
@@ -5681,8 +5801,10 @@ class FloatingWeatherClock:
             c.create_text(s(16), s(48), anchor="nw", text=date_main_text,
                           fill=date_main_color, font=(ff, fs),
                           tags=("date_text",))
-            if date_sub_text:
-                c.create_text(s(16), s(66), anchor="nw", text=date_sub_text,
+            # 简略模式：副行只显示原始副行内容（不带月相）
+            brief_sub = date_info["normal_line2"] if date_ready else ""
+            if brief_sub:
+                c.create_text(s(16), s(66), anchor="nw", text=brief_sub,
                               fill=date_sub_color, font=(ff, fs - 1),
                               tags=("date_text",))
             return
@@ -5758,6 +5880,10 @@ class FloatingWeatherClock:
                     c.create_text(s(24), info_y, anchor="nw", text=date_info["detail_holiday"],
                                   fill=sub_color, font=(ff, max(6, fs - 1)))
                     info_y += s(18)
+                if date_info["detail_yuexiang"]:
+                    c.create_text(s(24), info_y, anchor="nw", text=date_info["detail_yuexiang"],
+                                  fill=sub_color, font=(ff, max(6, fs - 1)))
+                    info_y += s(18)                    
 
             line_y = s(150)
             c.create_line(s(24), line_y, w - s(24), line_y,
@@ -5820,6 +5946,56 @@ class FloatingWeatherClock:
             x1, y2, x1, y2 - r, x1, y1 + r, x1, y1
         ]
         return canvas.create_polygon(pts, smooth=True, **kw)
+        
+    def _draw_moon(self, canvas, cx, cy, r, phase_index, bg_color, tags="icon"):
+        """按 8 相月相画月亮。
+        phase_index: 0=新月, 1=峨眉月, 2=上弦月, 3=盈凸月,
+                     4=满月, 5=亏凸月, 6=下弦月, 7=残月
+        bg_color: 用来“遮”掉月亮一部分的背景色（图标用 self.bg_color，背景用 panel_color）
+        """
+        try:
+            phase_index = int(phase_index) % 8
+        except Exception:
+            phase_index = 4
+
+        # 月亮主色（柔和米黄）
+        moon_fill = "#f5e6a8"
+        moon_outline = "#c8c098"
+
+        # 先画一个完整的亮圆（作为基础）
+        canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                           fill=moon_fill, outline=moon_outline,
+                           width=max(1, int(r * 0.08)), tags=tags)
+
+        # 满月：不遮
+        if phase_index == 4:
+            return
+
+        # 新月：整个用背景色盖掉（看起来就是黑的/看不见）
+        if phase_index == 0:
+            canvas.create_oval(cx - r - 1, cy - r - 1, cx + r + 1, cy + r + 1,
+                               fill=bg_color, outline="", tags=tags)
+            return
+
+        # 中间相位：用一个偏移的“暗圆”去遮住亮圆的一部分
+        # offset_ratio 决定暗圆的横向偏移量
+        # 盈月（1~3）：暗圆向右偏，露出左边
+        # 亏月（5~7）：暗圆向左偏，露出右边
+        offset_map = {
+            1: 0.90,   # 峨眉月：遮掉大部分，只露一细条
+            2: 0.50,   # 上弦月：遮掉右半
+            3: 0.15,   # 盈凸月：遮掉一小部分
+            5: -0.15,  # 亏凸月
+            6: -0.50,  # 下弦月
+            7: -0.90,  # 残月
+        }
+        offset_ratio = offset_map.get(phase_index, 0.0)
+        offset_x = int(r * 2 * offset_ratio)
+
+        # 暗圆：和亮圆同大小，但横向偏移，用背景色填充
+        canvas.create_oval(cx - r + offset_x, cy - r,
+                           cx + r + offset_x, cy + r,
+                           fill=bg_color, outline="", tags=tags)    
 
 
 if __name__ == "__main__":
