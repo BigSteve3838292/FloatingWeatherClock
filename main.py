@@ -90,7 +90,7 @@ def _enable_dpi_awareness():
 
 _enable_dpi_awareness()
 
-APP_VERSION = "1.0.9.1"
+APP_VERSION = "1.0.9.2"
 GITHUB_REPO = "BigSteve3838292/FloatingWeatherClock"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_API_RELEASES = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
@@ -834,6 +834,7 @@ class FloatingWeatherClock:
         self.weather_queue = queue.Queue()
         self.weather_data = None
         self.is_fetching_weather = False
+        self._last_weather_tag = "cloudy"
 
         self.root.after_idle(self.apply_window_attr)
         self.start_tray()
@@ -4717,6 +4718,16 @@ class FloatingWeatherClock:
                 if status == "ok":
                     self.weather_data = payload
                     self.last_weather_refresh_time = time.time()
+                    
+                    # ===== 新增：记录当前天气 tag，供刷新期间保持背景 =====
+                    try:
+                        code = payload.get("current", {}).get("weather_code", -1)
+                        self._last_weather_tag = WEATHER_CODE_MAP.get(
+                            code, {"tag": "cloudy"}).get("tag", "cloudy")
+                    except Exception:
+                        pass
+                    # =====================================================
+                    
                     t = payload.get("current", {}).get("temperature_2m", "?")
                     self.log(f"天气更新成功：{self.city} {t}℃")
                     if self.enable_refresh_animation:
@@ -5691,9 +5702,13 @@ class FloatingWeatherClock:
             border_color = "#444c60"
             self._draw_rpg_bg(c, w, h)
         elif self.weather_bg_enabled:
-            weather_tag = effective["tag"] if effective is not None else "cloudy"
+            # 优先：测试天气 → 当前有效天气 → 上一次成功的天气 → 兜底 cloudy
             if self.test_weather_enabled and self.test_weather_data is not None:
                 weather_tag = self.test_weather_data.get("tag", "clear")
+            elif effective is not None:
+                weather_tag = effective["tag"]
+            else:
+                weather_tag = getattr(self, "_last_weather_tag", "cloudy")
             self._draw_weather_bg(c, w, h, weather_tag, period)
 
             main_color = "#ffffff"
