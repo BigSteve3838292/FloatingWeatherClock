@@ -90,7 +90,7 @@ def _enable_dpi_awareness():
 
 _enable_dpi_awareness()
 
-APP_VERSION = "1.0.9.2"
+APP_VERSION = "1.1.1"
 GITHUB_REPO = "BigSteve3838292/FloatingWeatherClock"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_API_RELEASES = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
@@ -516,56 +516,15 @@ def make_scrollable_toplevel(parent, title, geometry="640x850",
     win = tk.Toplevel(parent)
     win.title(title)
 
-    try:
-        if dpi_scale and dpi_scale > 1.0:
-            m = re.match(r"(\d+)x(\d+)", geometry or "")
-            if m:
-                gw, gh = int(m.group(1)), int(m.group(2))
-                geometry = f"{int(gw * dpi_scale)}x{int(gh * dpi_scale)}"
-            if minsize and len(minsize) == 2:
-                minsize = (int(minsize[0] * dpi_scale),
-                           int(minsize[1] * dpi_scale))
-    except Exception:
-        pass
-
+    # 方案一：不再手动乘 dpi_scale，物理缩放交给 Tk scaling。
+    # dpi_scale 参数保留仅为兼容旧调用，不参与计算。
     win.geometry(geometry)
     win.minsize(*minsize)
+    win.resizable(True, False)   # 只允许调宽，不允许调高
     win.attributes("-topmost", True)
     win.transient(parent)
     hide_toplevel_taskbar(win)
     win.grab_set()
-
-    try:
-        if dpi_scale and dpi_scale > 1.0:
-            for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
-                         "TkHeadingFont"):
-                try:
-                    f = tkfont.nametofont(name)
-                    cur = f.cget("size")
-                    if cur == 0:
-                        continue
-                    new_size = max(6, int(round(abs(cur) * dpi_scale)))
-                    f.configure(size=new_size if cur > 0 else -new_size)
-                except Exception:
-                    pass
-            try:
-                style = ttk.Style(win)
-                f = tkfont.nametofont("TkDefaultFont")
-                for sname in ("TLabel", "TButton", "TCheckbutton",
-                              "TRadiobutton", "TEntry", "TCombobox",
-                              "TSpinbox", "TLabelframe", "TLabelframe.Label"):
-                    try:
-                        style.configure(sname, font=f)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            try:
-                win.option_add("*Font", tkfont.nametofont("TkDefaultFont"))
-            except Exception:
-                pass
-    except Exception:
-        pass
 
     outer_frame = ttk.Frame(win)
     outer_frame.pack(fill=tk.BOTH, expand=True)
@@ -1288,6 +1247,7 @@ class FloatingWeatherClock:
 
     # ================= DPI 辅助 =================
     def _apply_dpi_to_toplevel(self, win):
+        """给 Toplevel 应用 DPI 缩放。"""
         try:
             scale = getattr(self, "dpi_scale", 1.0)
             if scale <= 1.0:
@@ -1296,53 +1256,30 @@ class FloatingWeatherClock:
             win.update_idletasks()
             cur_w = win.winfo_width()
             cur_h = win.winfo_height()
-            if cur_w > 1 and cur_h > 1:
-                win.geometry(f"{int(cur_w * scale)}x{int(cur_h * scale)}")
-
-            for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
-                         "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont",
-                         "TkIconFont", "TkTooltipFont"):
+            if cur_w <= 1 or cur_h <= 1:
                 try:
-                    f = tkfont.nametofont(name)
-                    cur = f.cget("size")
-                    if cur == 0:
-                        continue
-                    new_size = max(6, int(round(abs(cur) * scale)))
-                    f.configure(size=new_size if cur > 0 else -new_size)
+                    gw, gh = win.geometry().split("+")[0].split("x")
+                    cur_w, cur_h = int(gw), int(gh)
+                except Exception:
+                    cur_w, cur_h = 640, 850
+
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            new_w = min(int(cur_w * scale), int(sw * 0.95))
+            new_h = min(int(cur_h * scale), int(sh * 0.9))
+            win.geometry(f"{new_w}x{new_h}")
+            win.minsize(int(new_w * 0.7), int(new_h * 0.7))
+
+            def _do_center():
+                try:
+                    if not win.winfo_exists():
+                        return
+                    self._center_on_parent_safe(win)
                 except Exception:
                     pass
 
             try:
-                style = ttk.Style(win)
-                for sname in ("TLabel", "TButton", "TCheckbutton",
-                              "TRadiobutton", "TEntry", "TCombobox",
-                              "TSpinbox", "TNotebook", "TNotebook.Tab",
-                              "TFrame", "TLabelframe", "TLabelframe.Label"):
-                    try:
-                        f = tkfont.nametofont("TkDefaultFont")
-                        style.configure(sname, font=f)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-            try:
-                win.option_add("*Font", tkfont.nametofont("TkDefaultFont"))
-            except Exception:
-                pass
-
-            try:
-                sw = win.winfo_screenwidth()
-                sh = win.winfo_screenheight()
-                new_w = min(int(cur_w * scale), int(sw * 0.95))
-                new_h = min(int(cur_h * scale), int(sh * 0.9))
-                win.geometry(f"{new_w}x{new_h}")
-                win.minsize(int(new_w * 0.7), int(new_h * 0.7))
-            except Exception:
-                pass
-
-            try:
-                self._center_on_parent(win)
+                win.after_idle(_do_center)
             except Exception:
                 pass
 
@@ -1352,32 +1289,98 @@ class FloatingWeatherClock:
             except Exception:
                 pass
 
-    def _center_on_parent(self, win):
+    def _center_window_once(self, win, delay_ms=80):
+        """把窗口居中到主窗口（主窗口不可用时居中到屏幕），只执行一次。
+        delay_ms：延迟多少毫秒执行，等窗口布局稳定后再居中，避免拿到中间尺寸。
+        """
+        def _do():
+            try:
+                if not win.winfo_exists():
+                    return
+                # 如果用户已经开始拖动窗口（尺寸和初始值不同），放弃居中
+                # 避免在拖动中途改位置，导致"窗口往下移"
+                init = getattr(win, "_fwc_init_size", None)
+                if init is not None:
+                    try:
+                        cw = win.winfo_width()
+                        ch = win.winfo_height()
+                        if abs(cw - init[0]) > 5 or abs(ch - init[1]) > 5:
+                            return
+                    except Exception:
+                        pass
+                w = win.winfo_width()
+                h = win.winfo_height()
+                if w <= 1 or h <= 1:
+                    return
+
+                sw = win.winfo_screenwidth()
+                sh = win.winfo_screenheight()
+
+                px = py = None
+                try:
+                    if (self.root.winfo_exists()
+                            and self.root.state() != "withdrawn"
+                            and self.root.winfo_width() > 1):
+                        px = self.root.winfo_x()
+                        py = self.root.winfo_y()
+                        pw = self.root.winfo_width()
+                        ph = self.root.winfo_height()
+                except Exception:
+                    px = py = None
+
+                if px is not None and pw > 0 and ph > 0:
+                    x = px + (pw - w) // 2
+                    y = py + (ph - h) // 2
+                else:
+                    x = (sw - w) // 2
+                    y = (sh - h) // 2
+
+                margin = 8
+                x = max(margin, min(x, sw - w - margin))
+                y = max(margin, min(y, sh - h - margin))
+                win.geometry(f"+{x}+{y}")
+            except Exception:
+                pass
+
+        try:
+            win.after(delay_ms, _do)
+        except Exception:
+            pass
+
+    def _center_on_parent_safe(self, win):
+        """把子窗口居中到主窗口（主窗口不可用时居中到屏幕）。"""
         try:
             win.update_idletasks()
             w = win.winfo_width()
             h = win.winfo_height()
-            try:
-                px = self.root.winfo_x()
-                py = self.root.winfo_y()
-                pw = self.root.winfo_width()
-                ph = self.root.winfo_height()
-            except Exception:
-                px = py = 0
-                pw = ph = 0
+            if w <= 1 or h <= 1:
+                return
 
             sw = win.winfo_screenwidth()
             sh = win.winfo_screenheight()
 
-            if pw > 0 and ph > 0:
+            px = py = None
+            try:
+                if (self.root.winfo_exists()
+                        and self.root.state() != "withdrawn"
+                        and self.root.winfo_width() > 1):
+                    px = self.root.winfo_x()
+                    py = self.root.winfo_y()
+                    pw = self.root.winfo_width()
+                    ph = self.root.winfo_height()
+            except Exception:
+                px = py = None
+
+            if px is not None and pw > 0 and ph > 0:
                 x = px + (pw - w) // 2
                 y = py + (ph - h) // 2
             else:
                 x = (sw - w) // 2
                 y = (sh - h) // 2
 
-            x = max(0, min(x, sw - w))
-            y = max(0, min(y, sh - h))
+            margin = 8
+            x = max(margin, min(x, sw - w - margin))
+            y = max(margin, min(y, sh - h - margin))
             win.geometry(f"+{x}+{y}")
         except Exception:
             pass
@@ -1414,6 +1417,148 @@ class FloatingWeatherClock:
         return win
 
     # ================= 字体预览对话框 =================
+    def open_font_picker(self, parent_win=None):
+        """独立字体选择窗口：不滚动，避免在设置面板滚动时误触。"""
+        if parent_win is None:
+            parent_win = self.root
+
+        result_holder = {"font": None}
+
+        win = tk.Toplevel(parent_win)
+        win.title("选择字体")
+        win.geometry("520x420")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        win.transient(parent_win)
+        hide_toplevel_taskbar(win)
+        win.grab_set()
+
+        self._apply_dpi_to_toplevel(win)
+
+        main_frame = ttk.Frame(win, padding=14)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(main_frame, text="选择字体：",
+                 font=(DEFAULT_FONT_FAMILY, 11, "bold")).pack(anchor="w")
+
+        # 字体下拉框 + 搜索框
+        search_var = tk.StringVar()
+        frame_search = ttk.Frame(main_frame)
+        frame_search.pack(fill=tk.X, pady=(4, 6))
+        tk.Label(frame_search, text="搜索：").pack(side=tk.LEFT)
+        search_entry = ttk.Entry(frame_search, textvariable=search_var)
+        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+
+        try:
+            all_fonts = sorted(set(tkfont.families()))
+        except Exception:
+            all_fonts = [DEFAULT_FONT_FAMILY]
+
+        list_frame = ttk.Frame(main_frame)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 6))
+
+        listbox = tk.Listbox(list_frame, font=(DEFAULT_FONT_FAMILY, 10),
+                             exportselection=False, activestyle="none")
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=sb.set)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def refresh_list(*_args):
+            kw = search_var.get().strip().lower()
+            listbox.delete(0, tk.END)
+            for f in all_fonts:
+                if not kw or kw in f.lower():
+                    listbox.insert(tk.END, f)
+            # 默认选中当前字体
+            try:
+                items = listbox.get(0, tk.END)
+                if self.font_family in items:
+                    idx = items.index(self.font_family)
+                    listbox.selection_set(idx)
+                    listbox.see(idx)
+                elif items:
+                    listbox.selection_set(0)
+            except Exception:
+                pass
+
+        refresh_list()
+        search_var.trace_add("write", refresh_list)
+
+        # 预览区
+        preview_frame = tk.Frame(main_frame, bg="#f5f5f5",
+                                 bd=1, relief="solid", height=70)
+        preview_frame.pack(fill=tk.X, pady=(0, 8))
+        preview_frame.pack_propagate(False)
+        preview_inner = tk.Frame(preview_frame, bg="#f5f5f5")
+        preview_inner.pack(expand=True, fill=tk.BOTH, padx=10, pady=8)
+
+        preview_label = tk.Label(
+            preview_inner,
+            text="12:34:56  悬浮时钟天气 · 字体预览",
+            font=(self.font_family, 12),
+            bg="#f5f5f5", fg="#222222"
+        )
+        preview_label.pack(anchor="w")
+
+        def on_select(event=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            fname = listbox.get(sel[0])
+            try:
+                preview_label.config(font=(fname, 12))
+            except Exception:
+                pass
+
+        listbox.bind("<<ListboxSelect>>", on_select)
+
+        # 双击直接确认
+        def on_double(event=None):
+            on_select()
+            on_ok()
+
+        listbox.bind("<Double-Button-1>", on_double)
+
+        # 按钮
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+
+        def on_ok():
+            sel = listbox.curselection()
+            if not sel:
+                messagebox.showinfo("提示", "请先选择一个字体。", parent=win)
+                return
+            fname = listbox.get(sel[0])
+            # 先让用户预览确认
+            if not self.preview_font_dialog(fname):
+                return
+            result_holder["font"] = fname
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        def on_cancel():
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        ttk.Button(btn_frame, text="确定", command=on_ok).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_frame, text="取消", command=on_cancel).pack(side=tk.LEFT, padx=6)
+
+        win.protocol("WM_DELETE_WINDOW", on_cancel)
+        try:
+            search_entry.focus_set()
+        except Exception:
+            pass
+
+        self.root.wait_window(win)
+        return result_holder["font"]
+    
     def preview_font_dialog(self, new_font):
         try:
             result_holder = {"accept": False}
@@ -3092,7 +3237,6 @@ class FloatingWeatherClock:
                 "悬浮时钟天气 - 开发者设置",
                 geometry="620x900",
                 minsize=(580, 820),
-                dpi_scale=self.dpi_scale
             )
 
             group_dev = ttk.LabelFrame(main_frame, text="开发者功能", padding=10)
@@ -3587,7 +3731,6 @@ class FloatingWeatherClock:
                 "测试天气数据",
                 geometry="500x760",
                 minsize=(480, 700),
-                dpi_scale=self.dpi_scale
             )
 
             tk.Label(main_frame, text="手动设置天气信息（仅用于 UI 测试）",
@@ -3843,7 +3986,6 @@ class FloatingWeatherClock:
                 "悬浮时钟天气 - 设置面板",
                 geometry="640x900",
                 minsize=(600, 840),
-                dpi_scale=self.dpi_scale
             )
 
             # ============ 愚人节彩蛋（仅 4 月 1 日显示，置顶；异常不影响后续控件）============
@@ -3941,24 +4083,18 @@ class FloatingWeatherClock:
             frame_font_family = ttk.Frame(group_display)
             frame_font_family.pack(fill=tk.X, pady=(0, 4))
             tk.Label(frame_font_family, text="字体：").pack(side=tk.LEFT)
-            try:
-                all_fonts = sorted(set(tkfont.families()))
-            except Exception:
-                all_fonts = [DEFAULT_FONT_FAMILY]
-            if self.font_family not in all_fonts:
-                all_fonts = [self.font_family] + all_fonts
-            font_family_var = tk.StringVar(value=self.font_family)
-            cb_font = ttk.Combobox(frame_font_family, textvariable=font_family_var,
-                                   values=all_fonts, state="readonly", width=30)
-            cb_font.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
-            def on_font_selected(event=None):
-                new_font = font_family_var.get().strip()
-                if not new_font or new_font == self.font_family:
-                    return
-                accepted = self.preview_font_dialog(new_font)
-                if accepted:
+            font_display_var = tk.StringVar(value=self.font_family)
+            tk.Label(frame_font_family, textvariable=font_display_var,
+                     font=(self.font_family, 10), anchor="w",
+                     relief="solid", bd=1, padx=6, pady=2
+                     ).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+            def choose_font():
+                new_font = self.open_font_picker(parent_win=win)
+                if new_font and new_font != self.font_family:
                     self.font_family = new_font
+                    font_display_var.set(new_font)
                     self.save_config()
                     self.need_redraw = True
                     try:
@@ -3966,14 +4102,9 @@ class FloatingWeatherClock:
                     except Exception:
                         pass
                     self.log(f"[字体] 已切换到 {new_font}")
-                else:
-                    try:
-                        font_family_var.set(self.font_family)
-                    except Exception:
-                        pass
-                    self.log(f"[字体] 用户拒绝字体 {new_font}，保持 {self.font_family}")
 
-            cb_font.bind("<<ComboboxSelected>>", on_font_selected)
+            ttk.Button(frame_font_family, text="选择字体…",
+                       command=choose_font).pack(side=tk.RIGHT, padx=(4, 0))
 
             frame_font = ttk.Frame(group_display)
             frame_font.pack(fill=tk.X)
