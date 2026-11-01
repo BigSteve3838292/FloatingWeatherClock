@@ -90,11 +90,17 @@ def _enable_dpi_awareness():
 
 _enable_dpi_awareness()
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.3"
 GITHUB_REPO = "BigSteve3838292/FloatingWeatherClock"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_API_RELEASES = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
+
+# ===== 公告源（主源失败自动试备用源）=====
+ANNOUNCEMENT_URLS = [
+    "https://raw.githubusercontent.com/BigSteve3838292/FloatingWeatherClock/main/announcement.json",
+    "https://cdn.jsdelivr.net/gh/BigSteve3838292/FloatingWeatherClock@main/announcement.json",
+]
 
 MUTEX_NAME = "FloatingWeatherClock_SingleInstance_Mutex"
 
@@ -516,11 +522,31 @@ def make_scrollable_toplevel(parent, title, geometry="640x850",
     win = tk.Toplevel(parent)
     win.title(title)
 
-    # 方案一：不再手动乘 dpi_scale，物理缩放交给 Tk scaling。
-    # dpi_scale 参数保留仅为兼容旧调用，不参与计算。
+    # 按 DPI 缩放初始 geometry 与 minsize，
+    # 保证不同缩放比例下窗口的“视觉大小”一致。
+    try:
+        scale = float(dpi_scale) if dpi_scale and dpi_scale > 0 else 1.0
+    except Exception:
+        scale = 1.0
+
+    try:
+        gw, gh = geometry.split("+")[0].split("x")
+        geo_w = max(1, int(int(gw) * scale))
+        geo_h = max(1, int(int(gh) * scale))
+        geometry = f"{geo_w}x{geo_h}"
+    except Exception:
+        pass
+
+    try:
+        ms_w = max(1, int(minsize[0] * scale))
+        ms_h = max(1, int(minsize[1] * scale))
+        minsize = (ms_w, ms_h)
+    except Exception:
+        pass
+
     win.geometry(geometry)
     win.minsize(*minsize)
-    win.resizable(True, False)   # 只允许调宽，不允许调高
+    win.resizable(False, False)  # 宽高都锁定，不允许拖动改变尺寸
     win.attributes("-topmost", True)
     win.transient(parent)
     hide_toplevel_taskbar(win)
@@ -730,13 +756,23 @@ class FloatingWeatherClock:
         self.last_weather_refresh_time = None
 
         self.refresh_start_time = 0
+        # 天气请求专属开始时间：只有它参与"天气超时"判定，
+        # 避免日期/节假日慢把天气判定拖成超时。
+        self._weather_request_start = 0
+        # 天气超时快进标记：本轮刷新已因超时把倒计时压到 10 秒后，
+        # 避免 update_clock 每秒重复重置倒计时，导致永远停在 10 秒。
+        self._weather_timeout_fastforward_done = False
 
         self.is_checking_update = False
         self._last_notified_version = None
         self._settings_lock_var_ref = None
 
+        # “连续点击版本号 5 次开启开发者选项”的计数器
+        self._version_click_count = 0
+
         self._singleton_windows = {}
         self._dev_options_opening = False
+        self._announcement_fetching = False
 
         self.beta_edition = BETA_EDITION
         self.beta_version = BETA_VERSION
@@ -793,7 +829,12 @@ class FloatingWeatherClock:
         self.weather_queue = queue.Queue()
         self.weather_data = None
         self.is_fetching_weather = False
-        self._last_weather_tag = "cloudy"
+        self._last_weather_tag = None
+        self._last_period = None
+        # 是否曾经成功拿到过一次天气（用于区分"首次获取中"和"刷新中沿用旧数据"）
+        self._has_weather_once = False
+        # 本轮刷新是否失败（用于在文字区显示"（刷新失败）"，失败时仍保留旧数据）
+        self._last_weather_failed = False
 
         self.root.after_idle(self.apply_window_attr)
         self.start_tray()
@@ -818,13 +859,8 @@ class FloatingWeatherClock:
         except Exception as e:
             self.log(f"初始化 beta UI 失败：{e}")
 
-        if not BETA_EDITION and self.developer_mode:
-            self.developer_mode = False
-            try:
-                self.save_config()
-                self.log("[安全] 非 Beta 版检测到残留的开发者模式，已清除")
-            except Exception as e:
-                self.log(f"[安全] 清除残留开发者模式失败：{e}")
+        # 说明：不再因为“非 Beta 版”而撤销开发者模式。
+        # 开发者模式只由“连续点击版本号 5 次”开启，一旦开启就保留到用户手动关闭。
 
     # ================= 版本号输出 =================
     def get_display_version(self):
@@ -1073,9 +1109,12 @@ class FloatingWeatherClock:
         return (time.time() - self.refresh_start_time) > REFRESH_TIMEOUT_SEC
 
     def _is_weather_timed_out(self):
-        if self.refresh_start_time <= 0:
+        # 只看天气请求自己的开始时间，日期/节假日慢不影响
+        if self._weather_request_start <= 0:
             return False
-        return (time.time() - self.refresh_start_time) > REFRESH_TIMEOUT_SEC
+        if not self.is_fetching_weather:
+            return False
+        return (time.time() - self._weather_request_start) > REFRESH_TIMEOUT_SEC
 
     # ================= 刷新动画 =================
     def _flash_refresh_animation(self):
@@ -1793,8 +1832,10 @@ class FloatingWeatherClock:
                                         command=self.menu_check_update)
         self.right_menu.add_command(label="关于本软件", command=self.show_about)
         self.right_menu.add_separator()
-        self.right_menu.add_command(label="开发者选项", command=self.open_dev_options)
-        self.right_menu.add_separator()
+        # 仅开发者模式开启后才显示
+        if self.developer_mode:
+            self.right_menu.add_command(label="开发者选项", command=self.open_dev_options)
+            self.right_menu.add_separator()
         self.right_menu.add_command(label="退出", command=self.quit_app)
 
     def _build_tray_menu(self):
@@ -1828,7 +1869,7 @@ class FloatingWeatherClock:
             enabled=(not self.beta_edition),
         )
 
-        menu = pystray.Menu(
+        menu_items = [
             pystray.MenuItem("显示窗口", lambda: tray_show_window()),
             pystray.MenuItem("刷新全局", lambda: tray_refresh_all()),
             pystray.MenuItem("打开设置", lambda: tray_open_settings()),
@@ -1838,10 +1879,14 @@ class FloatingWeatherClock:
                              checked=lambda item: self.lock_window),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("关于本软件", lambda: tray_show_about()),
-            pystray.MenuItem("开发者选项", lambda: tray_dev_options()),
+        ]
+        if self.developer_mode:
+            menu_items.append(pystray.MenuItem("开发者选项", lambda: tray_dev_options()))
+        menu_items.extend([
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("退出", lambda: tray_quit())
-        )
+            pystray.MenuItem("退出", lambda: tray_quit()),
+        ])
+        menu = pystray.Menu(*menu_items)
         return menu
 
     def refresh_beta_ui(self):
@@ -3093,8 +3138,13 @@ class FloatingWeatherClock:
 
             header = ttk.Frame(main_frame)
             header.pack(fill=tk.X, pady=(0, 8))
-            tk.Label(header, text=f"悬浮时钟天气  {self.get_display_version()}",
-                     font=(self.font_family, 13, "bold"), fg="#2f80ed").pack(anchor="w")
+            version_lbl = tk.Label(header,
+                                   text=f"悬浮时钟天气  {self.get_display_version()}",
+                                   font=(self.font_family, 13, "bold"),
+                                   fg="#2f80ed",
+                                   cursor="hand2")
+            version_lbl.pack(anchor="w")
+            version_lbl.bind("<Button-1>", lambda e: self._on_version_clicked())
             tk.Label(header, text=f"仓库：{GITHUB_REPO}",
                      font=(self.font_family, 8), fg="#888888").pack(anchor="w", pady=(2, 0))
 
@@ -3202,6 +3252,203 @@ class FloatingWeatherClock:
         if win is not None:
             self.root.wait_window(win)
 
+    def _on_version_clicked(self):
+        """连续点击版本号 5 次开启开发者选项。只提示，不自动打开窗口。"""
+        try:
+            # 已开启则不再重复计数
+            if self.developer_mode:
+                return
+            self._version_click_count += 1
+            remain = 5 - self._version_click_count
+            self.log(f"[版本号连点] 第 {self._version_click_count} 次，还需 {max(0, remain)} 次")
+
+            # 5 次以内不打扰，达到 5 次才提示
+            if self._version_click_count >= 5:
+                self._version_click_count = 0
+                self.developer_mode = True
+                try:
+                    self.save_config()
+                except Exception:
+                    pass
+                self.log("[开发者选项] 已通过连续点击版本号开启")
+                # 重建右键菜单和托盘，让“开发者选项”立即出现
+                try:
+                    self._build_right_menu()
+                except Exception:
+                    pass
+                try:
+                    if self.tray_icon is not None:
+                        self.tray_icon.menu = self._build_tray_menu()
+                        self.tray_icon.update_menu()
+                except Exception:
+                    pass
+                messagebox.showinfo(
+                    "开发者选项",
+                    "已开启开发者选项。\n\n"
+                    "现在可以在右键菜单或托盘菜单中找到「开发者选项」。",
+                    parent=self.root,
+                )
+        except Exception as e:
+            self.log(f"[版本号连点] 异常：{e}")
+
+    def _fetch_announcement_async(self, on_success, on_error):
+        if self.debug_offline:
+            on_error("调试模式：已关闭软件联网")
+            return
+        if self._announcement_fetching:
+            on_error("正在获取公告，请稍候…")
+            return
+        self._announcement_fetching = True
+
+        def worker():
+            last_err = None
+            try:
+                for url in ANNOUNCEMENT_URLS:
+                    try:
+                        ssl_ctx = ssl.create_default_context()
+                        ssl_ctx.check_hostname = False
+                        ssl_ctx.verify_mode = ssl.CERT_NONE
+                        req = urllib.request.Request(
+                            url,
+                            headers={"User-Agent": f"FloatingWeatherClock/{self.get_compare_version()}"},
+                        )
+                        with urllib.request.urlopen(req, timeout=15, context=ssl_ctx) as resp:
+                            data = json.loads(resp.read().decode("utf-8"))
+                        self.log(f"公告获取成功：{url}")
+                        self.root.after(0, lambda d=data: on_success(d))
+                        return
+                    except Exception as e:
+                        last_err = e
+                        self.log(f"公告源失败：{url} → {e}")
+                self.root.after(0, lambda err=last_err: on_error(str(err)))
+            finally:
+                self._announcement_fetching = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def open_announcement_window(self, parent_win=None):
+        if parent_win is None:
+            parent_win = self.root
+
+        def _creator():
+            win = tk.Toplevel(parent_win)
+            win.title("公告")
+            win.geometry("560x480")
+            win.minsize(480, 400)
+            win.attributes("-topmost", True)
+            win.transient(parent_win)
+            hide_toplevel_taskbar(win)
+            win.grab_set()
+
+            main_frame = ttk.Frame(win, padding=14)
+            main_frame.pack(fill=tk.BOTH, expand=True)
+
+            # ---- 先把按钮区固定到底部，保证任何内容高度下按钮都可见 ----
+            btn_frame = ttk.Frame(main_frame)
+            btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
+
+            refresh_btn = ttk.Button(btn_frame, text="刷新")
+            refresh_btn.pack(side=tk.LEFT, padx=4)
+            close_btn = ttk.Button(btn_frame, text="关闭", command=win.destroy)
+            close_btn.pack(side=tk.RIGHT, padx=4)
+
+            # ---- 顶部标题区 ----
+            header = ttk.Frame(main_frame)
+            header.pack(side=tk.TOP, fill=tk.X, pady=(0, 8))
+            title_lbl = tk.Label(header, text="正在获取公告…",
+                                 font=(self.font_family, 13, "bold"), fg="#2f80ed")
+            title_lbl.pack(anchor="w")
+            meta_lbl = tk.Label(header, text="", font=(self.font_family, 8), fg="#888888")
+            meta_lbl.pack(anchor="w", pady=(2, 0))
+
+            # ---- 中间文本区：占满剩余空间 ----
+            text_frame = ttk.Frame(main_frame)
+            text_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(2, 0))
+            txt = tk.Text(text_frame, wrap="word", font=(self.font_family, 10),
+                          relief="solid", borderwidth=1, padx=10, pady=8)
+            txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            sb = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
+            sb.pack(side=tk.RIGHT, fill=tk.Y)
+            txt.config(yscrollcommand=sb.set)
+            txt.insert("1.0", "正在从服务器获取最新公告…")
+            txt.config(state="disabled")
+
+            def _set_text(content):
+                txt.config(state="normal")
+                txt.delete("1.0", tk.END)
+                txt.insert("1.0", content)
+                txt.config(state="disabled")
+
+            def _set_title(text, color="#2f80ed"):
+                title_lbl.config(text=text, fg=color)
+
+            def _set_meta(text):
+                meta_lbl.config(text=text)
+
+            def _on_success(data):
+                try:
+                    if not win.winfo_exists():
+                        return
+                except Exception:
+                    return
+
+                if not isinstance(data, dict):
+                    _set_title("公告格式异常", "#c05000")
+                    _set_text("公告数据格式不正确，请联系开发者。")
+                    return
+
+                if not data.get("enabled", True):
+                    _set_title("暂无公告", "#2f80ed")
+                    _set_meta("")
+                    _set_text("当前没有需要展示的公告。")
+                    return
+
+                ann_title = data.get("title") or "公告"
+                level = data.get("level", "info")
+                color_map = {"info": "#2f80ed", "warning": "#e08a00", "important": "#d62828"}
+                _set_title(ann_title, color_map.get(level, "#2f80ed"))
+
+                meta_parts = []
+                if data.get("start"):
+                    meta_parts.append(f"开始：{data['start']}")
+                if data.get("end"):
+                    meta_parts.append(f"结束：{data['end']}")
+                _set_meta("　".join(meta_parts))
+
+                content = data.get("content") or "（无内容）"
+                _set_text(content)
+
+            def _on_error(err):
+                try:
+                    if not win.winfo_exists():
+                        return
+                except Exception:
+                    return
+                _set_title("公告获取失败", "#d62828")
+                _set_meta("")
+                _set_text(f"无法获取公告，请检查网络后重试。\n\n错误信息：\n{err}")
+
+            def _do_fetch():
+                _set_title("正在获取公告…")
+                _set_meta("")
+                _set_text("正在从服务器获取最新公告…")
+                refresh_btn.config(state="disabled")
+                self._fetch_announcement_async(
+                    on_success=lambda d: (_on_success(d), refresh_btn.config(state="normal")),
+                    on_error=lambda e: (_on_error(e), refresh_btn.config(state="normal")),
+                )
+
+            refresh_btn.config(command=_do_fetch)
+            win.protocol("WM_DELETE_WINDOW", win.destroy)
+
+            self._apply_dpi_to_toplevel(win)
+            win.after(100, _do_fetch)
+            return win
+
+        win = self._open_singleton("announcement", _creator)
+        if win is not None:
+            self.root.wait_window(win)
+
     def _update_about_text(self, txt_widget, new_text):
         try:
             if not txt_widget.winfo_exists():
@@ -3217,26 +3464,18 @@ class FloatingWeatherClock:
     def open_dev_options(self):
         if self._dev_options_opening:
             return
-        if not BETA_EDITION and not self.developer_mode:
-            self._dev_options_opening = True
-            try:
-                pwd = simpledialog.askstring("开发者验证", "请输入开发者密码：", show="*", parent=self.root)
-                if pwd is None:
-                    return
-                if pwd != "zhusihao20120824":
-                    messagebox.showerror("密码错误", "开发者密码不正确！")
-                    return
-                self.developer_mode = True
-                self.save_config()
-            finally:
-                self._dev_options_opening = False
+        # 入口由菜单控制：未开启开发者模式时不应进入
+        if not self.developer_mode:
+            self.log("[开发者选项] 未开启开发者模式，拒绝打开")
+            return
 
         def _creator():
             win, main_frame, fixed_btn_frame, on_close = make_scrollable_toplevel(
                 self.root,
                 "悬浮时钟天气 - 开发者设置",
-                geometry="620x900",
-                minsize=(580, 820),
+                geometry="620x740",
+                minsize=(580, 680),
+                dpi_scale=self.dpi_scale,
             )
 
             group_dev = ttk.LabelFrame(main_frame, text="开发者功能", padding=10)
@@ -3244,7 +3483,7 @@ class FloatingWeatherClock:
 
             dev_mode_var = tk.BooleanVar(value=self.developer_mode)
             ttk.Checkbutton(group_dev,
-                            text="启用开发者模式（关闭后下次进入需要密码）",
+                            text="开发者模式（取消勾选并保存后，右键/托盘菜单将隐藏「开发者选项」）",
                             variable=dev_mode_var).pack(anchor="w")
 
             frame_btn_row1 = ttk.Frame(group_dev)
@@ -3429,6 +3668,18 @@ class FloatingWeatherClock:
                 self.developer_mode = dev_mode_var.get()
                 self.debug_offline = dbg_offline_var.get()
 
+                # 开发者模式状态可能刚变化，重建菜单让入口立刻出现/消失
+                try:
+                    self._build_right_menu()
+                except Exception:
+                    pass
+                try:
+                    if self.tray_icon is not None:
+                        self.tray_icon.menu = self._build_tray_menu()
+                        self.tray_icon.update_menu()
+                except Exception:
+                    pass
+
                 if new_test != old_test:
                     if new_test:
                         self.test_weather_enabled = True
@@ -3443,7 +3694,6 @@ class FloatingWeatherClock:
                         self.is_refresh_hint = True
                         self.reset_refresh_countdown()
                         self.fetch_all_async()
-
                 self.apply_window_attr()
                 self.save_config()
                 self.need_redraw = True
@@ -3731,6 +3981,7 @@ class FloatingWeatherClock:
                 "测试天气数据",
                 geometry="500x760",
                 minsize=(480, 700),
+                dpi_scale=self.dpi_scale,
             )
 
             tk.Label(main_frame, text="手动设置天气信息（仅用于 UI 测试）",
@@ -3984,8 +4235,9 @@ class FloatingWeatherClock:
             win, main_frame, fixed_btn_frame, on_close = make_scrollable_toplevel(
                 self.root,
                 "悬浮时钟天气 - 设置面板",
-                geometry="640x900",
-                minsize=(600, 840),
+                geometry="640x760",
+                minsize=(600, 700),
+                dpi_scale=self.dpi_scale,
             )
 
             # ============ 愚人节彩蛋（仅 4 月 1 日显示，置顶；异常不影响后续控件）============
@@ -4197,6 +4449,19 @@ class FloatingWeatherClock:
                     btn_upgrade_beta.config(state="disabled")
                 except Exception:
                     pass
+
+            group_announcement = ttk.LabelFrame(main_frame, text="公告", padding=8)
+            group_announcement.pack(fill=tk.X, pady=6)
+            tk.Label(group_announcement,
+                     text="查看开发者发布的最新公告（仅在点击后联网获取，平时不打扰）",
+                     fg="#888888", font=(self.font_family, 8),
+                     wraplength=560, justify="left").pack(anchor="w", pady=(0, 6))
+
+            def open_announcement():
+                self.open_announcement_window(parent_win=win)
+
+            ttk.Button(group_announcement, text="查看公告",
+                       command=open_announcement).pack(anchor="w")
 
             group_system = ttk.LabelFrame(main_frame, text="系统选项", padding=8)
             group_system.pack(fill=tk.X, pady=6)
@@ -4800,10 +5065,15 @@ class FloatingWeatherClock:
             return
 
         self.refresh_start_time = time.time()
+        # 新一轮刷新开始，允许本轮再次触发“超时快进”
+        self._weather_timeout_fastforward_done = False
+        # 新一轮刷新开始，先清除上一轮的失败标记
+        self._last_weather_failed = False
 
         self.date_cache = None
         self.holiday_cache = None
-        self.weather_data = None
+        # 注意：不再清空 self.weather_data，刷新期间沿用旧天气数据渲染背景与文字，
+        # 避免“旧数据已清空、新数据未到”期间背景跳到兜底值造成跳变。
 
         self.date_cache = self._get_date_info()
         self._fetch_holiday_info_async(force=True)
@@ -4816,6 +5086,7 @@ class FloatingWeatherClock:
             return
         lat, lon = self.city_lat, self.city_lon
         self.is_fetching_weather = True
+        self._weather_request_start = time.time()
         self.log(f"刷新全局：请求天气 {self.city} ({lat}, {lon})")
 
         def worker():
@@ -4848,17 +5119,19 @@ class FloatingWeatherClock:
             if not self.test_weather_enabled:
                 if status == "ok":
                     self.weather_data = payload
+                    self._has_weather_once = True
+                    self._last_weather_failed = False
+                    self._weather_request_start = 0
                     self.last_weather_refresh_time = time.time()
-                    
-                    # ===== 新增：记录当前天气 tag，供刷新期间保持背景 =====
+
+                    # 记录当前天气 tag，供刷新期间保持背景
                     try:
                         code = payload.get("current", {}).get("weather_code", -1)
                         self._last_weather_tag = WEATHER_CODE_MAP.get(
                             code, {"tag": "cloudy"}).get("tag", "cloudy")
                     except Exception:
                         pass
-                    # =====================================================
-                    
+
                     t = payload.get("current", {}).get("temperature_2m", "?")
                     self.log(f"天气更新成功：{self.city} {t}℃")
                     if self.enable_refresh_animation:
@@ -4867,8 +5140,15 @@ class FloatingWeatherClock:
                         except Exception:
                             pass
                 else:
-                    self.weather_data = None
-                    self.log(f"天气更新失败：{payload}")
+                    # 刷新失败：保留旧 weather_data，避免背景/文字跳到兜底值
+                    self.log(f"天气更新失败（保留上次数据）：{payload}")
+                    self._last_weather_failed = True
+                    self._weather_request_start = 0
+                    # 失败直接快进到 10 秒后重试（不依赖 timed_out 判定）
+                    if not self._weather_timeout_fastforward_done:
+                        self._weather_timeout_fastforward_done = True
+                        self.refresh_countdown = 10
+                        self.log("[天气失败] 已把自动刷新倒计时压到 10 秒后重试")
                 self.is_refresh_hint = False
                 self.need_redraw = True
         except queue.Empty:
@@ -5815,8 +6095,13 @@ class FloatingWeatherClock:
         period = "day"
         if effective is not None:
             period = self._classify_period(effective)
+            self._last_period = period
         else:
-            period = "day" if 7 <= time.localtime().tm_hour <= 19 else "night"
+            # 刷新期间 effective 为 None 时沿用上一次的 period，
+            # 避免恰好跨过日出/日落边界导致背景色抖动
+            period = self._last_period or (
+                "day" if 7 <= time.localtime().tm_hour <= 19 else "night"
+            )
 
         is_sunrise = (period == "sunrise")
         is_sunset = (period == "sunset")
@@ -5839,7 +6124,8 @@ class FloatingWeatherClock:
             elif effective is not None:
                 weather_tag = effective["tag"]
             else:
-                weather_tag = getattr(self, "_last_weather_tag", "cloudy")
+                # 首次获取中：用中性 cloudy；刷新期间：沿用上一次成功的 tag
+                weather_tag = self._last_weather_tag or "cloudy"
             self._draw_weather_bg(c, w, h, weather_tag, period)
 
             main_color = "#ffffff"
@@ -5908,8 +6194,25 @@ class FloatingWeatherClock:
 
         self._text_rgb_date = _hex_to_rgb_tuple(date_main_color)
 
+        # 文字就绪：首次从未成功过且正在刷新 → False（显示"正在获取天气…"）
+        # 刷新期间（_has_weather_once=True）→ True（继续显示旧数据，不闪）
         weather_ready = (effective is not None)
         weather_timed_out = self._is_weather_timed_out()
+        # 背景是否就绪：只要有过成功数据或当前有数据，背景就沿用/使用
+        bg_ready = (effective is not None) or self._has_weather_once
+
+        # ---- 天气超时快进：超时后把自动刷新倒计时压到 10 秒，尽快重试 ----
+        # 只在"本轮刷新确实超时、且尚未快进过"时执行一次，
+        # 避免每秒重置导致倒计时永远停在 10 秒。
+        if (weather_timed_out
+                and not self._weather_timeout_fastforward_done
+                and not self.is_quitting):
+            self._weather_timeout_fastforward_done = True
+            # 第一次请求可能还挂在网络超时上，复位标志，
+            # 否则 10 秒后 auto_refresh_all_timer 触发的 fetch_all_async 会被直接 return。
+            self.is_fetching_weather = False
+            self.refresh_countdown = 10
+            self.log("[天气超时] 已把自动刷新倒计时压到 10 秒后重试")
 
         bottom_y = h - s(12)
         if self.show_auto_refresh_hint:
@@ -5940,44 +6243,60 @@ class FloatingWeatherClock:
         elif is_sunset:
             suffix = "（日落）"
 
+        # 刷新中标记：仅在"已有旧数据、正在请求新数据"时显示轻提示
+        refreshing_suffix = "（刷新中…）" if (self.is_fetching_weather and self._has_weather_once) else ""
+        # 刷新失败标记：优先显示失败（失败后 is_fetching_weather 已为 False）
+        failed_suffix = "（刷新失败）" if (self._last_weather_failed and self._has_weather_once) else ""
+
         if self.win_style == "brief":
-            c.create_text(s(16), s(14), anchor="nw", text=time_str,
-                          fill=main_color, font=(ff, fs + 8, "bold"),
+            c.create_text(w // 2, s(10), anchor="n", text=time_str,
+                          fill=main_color, font=(ff, fs + 12, "bold"),
                           tags=("main_text",))
-            c.create_text(s(16), s(48), anchor="nw", text=date_main_text,
+            c.create_text(w // 2, s(52), anchor="n", text=date_main_text,
                           fill=date_main_color, font=(ff, fs),
                           tags=("date_text",))
             # 简略模式：副行只显示原始副行内容（不带月相）
             brief_sub = date_info["normal_line2"] if date_ready else ""
             if brief_sub:
-                c.create_text(s(16), s(66), anchor="nw", text=brief_sub,
+                c.create_text(w // 2, s(72), anchor="n", text=brief_sub,
                               fill=date_sub_color, font=(ff, fs - 1),
                               tags=("date_text",))
             return
 
         if self.win_style == "normal":
-            c.create_text(s(20), s(14), anchor="nw", text=time_str,
-                          fill=main_color, font=(ff, fs + 8, "bold"),
+            c.create_text(w // 2, s(10), anchor="n", text=time_str,
+                          fill=main_color, font=(ff, fs + 12, "bold"),
                           tags=("main_text",))
-            c.create_text(s(20), s(48), anchor="nw", text=date_main_text,
+            c.create_text(w // 2, s(52), anchor="n", text=date_main_text,
                           fill=date_main_color, font=(ff, fs),
                           tags=("date_text",))
             if date_sub_text:
-                c.create_text(s(20), s(66), anchor="nw", text=date_sub_text,
+                c.create_text(w // 2, s(72), anchor="n", text=date_sub_text,
                               fill=date_sub_color, font=(ff, max(6, fs - 1)),
                               tags=("date_text",))
-            weather_y = s(88)
+            weather_y = s(94)
             icon_cx, icon_cy, text_x = s(28), weather_y + s(12), s(60)
             if weather_ready:
                 try:
                     is_day = period in ("day", "sunrise")
                     self.draw_weather_icon(icon_cx, icon_cy, is_day, effective["tag"], period)
-                    desc_with_suffix = f"{effective['desc']}{suffix}"
+                    desc_with_suffix = f"{effective['desc']}{suffix}{refreshing_suffix}"
                     temp_text = self._format_temp(effective['temp'])
-                    c.create_text(text_x, weather_y, anchor="nw",
-                                  text=f"{effective['city']}  {temp_text}  {desc_with_suffix}",
-                                  fill=main_color, font=(ff, fs, "bold"),
-                                  tags=("weather_text",))
+                    main_line_text = f"{effective['city']}  {temp_text}  {desc_with_suffix}"
+                    main_item = c.create_text(text_x, weather_y, anchor="nw",
+                                              text=main_line_text,
+                                              fill=main_color, font=(ff, fs, "bold"),
+                                              tags=("weather_text",))
+                    # 刷新失败：在主行右侧画红色“（刷新失败）”
+                    if failed_suffix:
+                        try:
+                            bbox = c.bbox(main_item)
+                            fail_x = (bbox[2] + s(6)) if bbox else (text_x + s(180))
+                        except Exception:
+                            fail_x = text_x + s(180)
+                        c.create_text(fail_x, weather_y, anchor="nw",
+                                      text=failed_suffix,
+                                      fill="#ff5555", font=(ff, fs, "bold"))
                     c.create_text(text_x, weather_y + s(28), anchor="nw",
                                   text=f"湿度 {effective['humidity']}% ｜ {self._format_wind_line(effective)}",
                                   fill=sub_color, font=(ff, max(6, fs - 1)))
@@ -5992,7 +6311,7 @@ class FloatingWeatherClock:
                     c.create_text(text_x, weather_y, anchor="nw", text="天气解析出错",
                                   fill="#ff8888", font=(ff, fs))
             else:
-                if weather_timed_out:
+                if weather_timed_out or self._last_weather_failed:
                     c.create_text(text_x, weather_y, anchor="nw", text="天气获取失败",
                                   fill="#ff5555", font=(ff, fs))
                 else:
@@ -6001,35 +6320,35 @@ class FloatingWeatherClock:
             return
 
         if self.win_style == "detailed":
-            c.create_text(s(24), s(14), anchor="nw", text=time_str,
-                          fill=main_color, font=(ff, fs + 8, "bold"),
+            c.create_text(w // 2, s(10), anchor="n", text=time_str,
+                          fill=main_color, font=(ff, fs + 12, "bold"),
                           tags=("main_text",))
-            c.create_text(s(24), s(48), anchor="nw", text=date_main_text,
+            c.create_text(w // 2, s(52), anchor="n", text=date_main_text,
                           fill=date_main_color, font=(ff, fs),
                           tags=("date_text",))
 
             if date_ready:
-                info_y = s(70)
+                info_y = s(76)
                 if date_info["detail_lunar"]:
-                    c.create_text(s(24), info_y, anchor="nw", text=date_info["detail_lunar"],
+                    c.create_text(w // 2, info_y, anchor="n", text=date_info["detail_lunar"],
                                   fill=sub_color, font=(ff, max(6, fs - 1)))
                     info_y += s(18)
                 if date_info["detail_jieqi"]:
-                    c.create_text(s(24), info_y, anchor="nw", text=date_info["detail_jieqi"],
+                    c.create_text(w // 2, info_y, anchor="n", text=date_info["detail_jieqi"],
                                   fill=sub_color, font=(ff, max(6, fs - 1)))
                     info_y += s(18)
                 if date_info["detail_festivals"]:
-                    c.create_text(s(24), info_y, anchor="nw", text=date_info["detail_festivals"],
+                    c.create_text(w // 2, info_y, anchor="n", text=date_info["detail_festivals"],
                                   fill=sub_color, font=(ff, max(6, fs - 1)))
                     info_y += s(18)
                 if date_info["detail_holiday"]:
-                    c.create_text(s(24), info_y, anchor="nw", text=date_info["detail_holiday"],
+                    c.create_text(w // 2, info_y, anchor="n", text=date_info["detail_holiday"],
                                   fill=sub_color, font=(ff, max(6, fs - 1)))
                     info_y += s(18)
                 if date_info["detail_yuexiang"]:
-                    c.create_text(s(24), info_y, anchor="nw", text=date_info["detail_yuexiang"],
+                    c.create_text(w // 2, info_y, anchor="n", text=date_info["detail_yuexiang"],
                                   fill=sub_color, font=(ff, max(6, fs - 1)))
-                    info_y += s(18)                    
+                    info_y += s(18)
 
             line_y = s(150)
             c.create_line(s(24), line_y, w - s(24), line_y,
@@ -6040,15 +6359,25 @@ class FloatingWeatherClock:
                 try:
                     is_day = period in ("day", "sunrise")
                     self.draw_weather_icon(icon_cx, icon_cy, is_day, effective["tag"], period)
-                    desc_with_suffix = f"{effective['desc']}{suffix}"
+                    desc_with_suffix = f"{effective['desc']}{suffix}{refreshing_suffix}"
                     temp_text = self._format_temp(effective['temp'])
                     c.create_text(text_x, weather_y, anchor="nw", text="当前天气",
                                   fill="#a0b4d8",
                                   font=(ff, fs, "bold"),
                                   tags=("weather_text",))
-                    c.create_text(text_x, weather_y + s(24), anchor="nw",
-                                  text=f"{effective['city']} · {temp_text} · {desc_with_suffix}",
-                                  fill=main_color, font=(ff, fs + 1))
+                    detail_line_text = f"{effective['city']} · {temp_text} · {desc_with_suffix}"
+                    detail_item = c.create_text(text_x, weather_y + s(24), anchor="nw",
+                                                text=detail_line_text,
+                                                fill=main_color, font=(ff, fs + 1))
+                    if failed_suffix:
+                        try:
+                            bbox = c.bbox(detail_item)
+                            fail_x = (bbox[2] + s(6)) if bbox else (text_x + s(220))
+                        except Exception:
+                            fail_x = text_x + s(220)
+                        c.create_text(fail_x, weather_y + s(24), anchor="nw",
+                                      text=failed_suffix,
+                                      fill="#ff5555", font=(ff, fs + 1, "bold"))
                     c.create_text(text_x, weather_y + s(56), anchor="nw", text="环境参数",
                                   fill="#a0b4d8",
                                   font=(ff, fs, "bold"))
@@ -6078,7 +6407,7 @@ class FloatingWeatherClock:
                     c.create_text(text_x, weather_y, anchor="nw", text="天气解析出错",
                                   fill="#ff8888", font=(ff, fs))
             else:
-                if weather_timed_out:
+                if weather_timed_out or self._last_weather_failed:
                     c.create_text(text_x, weather_y, anchor="nw", text="天气获取失败",
                                   fill="#ff5555", font=(ff, fs))
                 else:
