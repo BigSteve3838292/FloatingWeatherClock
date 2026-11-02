@@ -90,7 +90,7 @@ def _enable_dpi_awareness():
 
 _enable_dpi_awareness()
 
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 GITHUB_REPO = "BigSteve3838292/FloatingWeatherClock"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_API_RELEASES = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
@@ -822,6 +822,7 @@ class FloatingWeatherClock:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close_window)
 
         self._lock_menu_var = tk.BooleanVar(value=self.lock_window)
+        self._top_menu_var = tk.BooleanVar(value=self.always_on_top)
 
         self.right_menu = tk.Menu(root, tearoff=0)
         self._build_right_menu()
@@ -1279,6 +1280,11 @@ class FloatingWeatherClock:
     def _show_window_and_fix(self):
         try:
             self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True) # 强制置顶一下
+            if not self.always_on_top:
+                # 如果用户没勾选一直置顶，短暂置顶后恢复（避免永久抢占顶层）
+                self.root.after(500, lambda: self.root.attributes("-topmost", False))
             self.root.update_idletasks()
             self._fix_taskbar_style()
         except Exception:
@@ -1822,6 +1828,9 @@ class FloatingWeatherClock:
         self.right_menu.add_checkbutton(label="锁定窗口位置",
                                         variable=self._lock_menu_var,
                                         command=self._on_lock_menu_clicked)
+        self.right_menu.add_checkbutton(label="窗口置顶",
+                                        variable=self._top_menu_var,
+                                        command=self._on_top_menu_clicked)
         self.right_menu.add_command(label="打开设置", command=self.open_settings)
         if self.beta_edition:
             self.right_menu.add_command(label="检查更新",
@@ -1860,6 +1869,9 @@ class FloatingWeatherClock:
         def tray_toggle_lock(icon, item):
             self.root.after(0, self._toggle_lock_from_tray)
 
+        def tray_toggle_top(icon, item):
+            self.root.after(0, self._toggle_top_from_tray)
+
         def tray_quit():
             self.root.after(0, self.quit_app)
 
@@ -1877,6 +1889,8 @@ class FloatingWeatherClock:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("锁定窗口位置", tray_toggle_lock,
                              checked=lambda item: self.lock_window),
+            pystray.MenuItem("窗口置顶", tray_toggle_top,
+                             checked=lambda item: self.always_on_top),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("关于本软件", lambda: tray_show_about()),
         ]
@@ -4189,21 +4203,50 @@ class FloatingWeatherClock:
     def _toggle_lock_from_tray(self):
         self._set_lock_window(not self.lock_window)
 
+    def _set_always_on_top(self, value):
+        self.always_on_top = bool(value)
+        try:
+            self._top_menu_var.set(self.always_on_top)
+        except Exception:
+            pass
+        try:
+            self.root.attributes("-topmost", self.always_on_top)
+        except Exception:
+            pass
+        self.save_config()
+        try:
+            if self.tray_icon is not None:
+                self.tray_icon.update_menu()
+        except Exception:
+            pass
+
+    def _on_top_menu_clicked(self):
+        try:
+            target = bool(self._top_menu_var.get())
+        except Exception:
+            target = not self.always_on_top
+        self._set_always_on_top(target)
+
+    def _toggle_top_from_tray(self):
+        self._set_always_on_top(not self.always_on_top)
+
     def on_close_window(self):
         self.save_config()
         self.root.withdraw()
 
     def bind_mouse_events(self):
+        # 1. 处理拖动事件（锁定后禁用）
         if self.lock_window:
             self.canvas.unbind("<ButtonPress-1>")
             self.canvas.unbind("<B1-Motion>")
             self.root.unbind("<ButtonRelease-1>")
-            self.canvas.unbind("<Button-3>")
         else:
             self.canvas.bind("<ButtonPress-1>", self.on_drag_start)
             self.canvas.bind("<B1-Motion>", self.on_drag_move)
             self.root.bind("<ButtonRelease-1>", self.on_drag_end)
-            self.canvas.bind("<Button-3>", self.show_right_menu)
+
+        # 2. 处理右键菜单（始终绑定，不受锁定影响）
+        self.canvas.bind("<Button-3>", self.show_right_menu)
 
     def apply_window_attr(self):
         try:
@@ -4282,7 +4325,7 @@ class FloatingWeatherClock:
 
             ttk.Checkbutton(group_win, text="窗口置顶", variable=top_var).pack(anchor="w")
             ttk.Checkbutton(group_win,
-                            text="锁定窗口位置（锁定后无法用鼠标拖动窗口，从托盘菜单解锁）",
+                            text="锁定窗口位置（锁定后无法用鼠标拖动窗口，仍可通过右键菜单或托盘解锁）",
                             variable=lock_var).pack(anchor="w")
 
             weather_bg_var = tk.BooleanVar(value=self.weather_bg_enabled)
@@ -4601,6 +4644,7 @@ class FloatingWeatherClock:
                 if old_font != self.font_size:
                     self.recalc_window_size_by_font()
                 self._set_lock_window(new_lock)
+                self._set_always_on_top(top_var.get())
                 self.apply_window_attr()
                 set_startup(startup_var.get())
                 self.save_config()
@@ -4756,10 +4800,11 @@ class FloatingWeatherClock:
         self.save_config()
 
     def show_right_menu(self, event):
-        if self.is_quitting or self.lock_window:
+        if self.is_quitting:
             return
         try:
             self._lock_menu_var.set(self.lock_window)
+            self._top_menu_var.set(self.always_on_top)
         except Exception:
             pass
         try:
